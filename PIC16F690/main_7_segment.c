@@ -1,131 +1,168 @@
 /* ==========================================================================
  * MCU:         PIC16F690
  * FREQUENCY:   8.0 MHz Internal Oscillator
- * COMPONENTS:  1x 5011AS 7-Segment Display (Common-Cathode)
- * HARDWARE:    1 kOhm current-limiting resistors on each segment
+ * COMPONENTS:  1x 5011AS 7-Segment Display (Common-Cathode), 1x Push Button (RA3)
+ * HARDWARE:    1 kOhm current-limiting resistors on segments, internal/external pull-up
  * DESCRIPTION:
- * Drives a single-digit 7-segment display to automatically cycle from 0 to 9 
- * and light up the decimal point (DP) on index 9/10. Splits the segment bitmasks 
- * across PORTC (segments A-F) and PORTA (segment G and DP). Uses a precise 
- * 16-bit Timer1 interrupt setup (100 ms overflows) to increment the digit 
- * every 1 second (10 ticks) without blocking the processor.
+ * Drives a single-digit 7-segment display using a non-blocking Finite State 
+ * Machine (FSM) to sequentially increment from 0 to 9 on button press. Splits 
+ * the segment bitmasks across PORTC (segments A-F) and PORTA (segment G and DP).
+ * Uses a 16-bit Timer1 setup with a 1:8 prescaler (~1 ms overflows) to run a 
+ * 250 ms mechanical debounce window when a button edge is tracked, preventing 
+ * double-triggering or contact noise.
  * ========================================================================== */
 
 #include <xc.h>
 
-#pragma config FOSC = INTRCIO   // Internal oscillator, I/O function on RA4/RA5
-#pragma config WDTE = OFF       // Watchdog Timer Disabled
-#pragma config PWRTE = ON       // Power-up Timer Enabled
-#pragma config MCLRE = OFF      // MCLR pin function is digital input
-#pragma config CP = OFF         // Code Protection Disabled
-#pragma config CPD = OFF        // Data Code Protection Disabled
-#pragma config BOREN = OFF      // Brown-out Reset Disabled
-#pragma config IESO = OFF       // Internal External Switchover Disabled
-#pragma config FCMEN = OFF      // Fail-Safe Clock Monitor Disabled
+// Configuration Bits
+#pragma config FOSC = INTRCIO // Internal oscillator, no external crystal needed
+#pragma config WDTE = OFF     // Watchdog Timer disabled
+#pragma config PWRTE = ON     // Power-up Timer enabled (holds MCU until voltage stabilizes)
+#pragma config MCLRE = OFF    // Master Clear (reset pin) functions as a standard digital input
+#pragma config CP = OFF       // Flash Program Memory code protection disabled
+#pragma config CPD = OFF      // Data EEPROM code protection disabled
+#pragma config BOREN = OFF    // Brown-out Reset disabled
+#pragma config IESO = OFF     // Internal/External Switchover mode disabled
+#pragma config FCMEN = OFF    // Fail-Safe Clock Monitor disabled
 
-#define _XTAL_FREQ 8000000     // 8 MHz system clock
+#define _XTAL_FREQ 8000000    // System clock frequency (8 MHz)
 
-// PORTC Segment Bitmasks
-#define seg_A 0x01 // RC0
-#define seg_B 0x02 // RC1
-#define seg_C 0x04 // RC2
-#define seg_D 0x08 // RC3
-#define seg_E 0x10 // RC4
-#define seg_F 0x20 // RC5
+// Bitmasks for the 7-segment display segments mapped to PORTC
+#define seg_A 0x01
+#define seg_B 0x02
+#define seg_C 0x04
+#define seg_D 0x08
+#define seg_E 0x10
+#define seg_F 0x20
 
-// PORTA Segment Bitmasks
-#define seg_G 0x04 // RA2
-#define seg_P 0x20 // RA5 (Decimal Point)
+// Bitmasks for segment G, decimal point (P), and button mapped to PORTA
+#define seg_G 0x04
+#define seg_P 0x20
+#define btn   0x08            // Button connected to RA3 (1 << 3)
 
-// Array containing segment configurations for PORTC (Digits 0-9, then blank/clear)
-unsigned char number_PORTC[] = {
-    (seg_A | seg_B | seg_C | seg_D | seg_E | seg_F), 
-    (seg_B | seg_C), 
-    (seg_A | seg_B | seg_E | seg_D), 
-    (seg_A | seg_B | seg_C | seg_D),
-    (seg_B | seg_C | seg_F),
-    (seg_A | seg_F | seg_C | seg_D),
-    (seg_A | seg_F | seg_C | seg_D | seg_E),
-    (seg_A | seg_B | seg_C),
-    (seg_A | seg_B | seg_C | seg_D | seg_E | seg_F),
-    (seg_A | seg_B | seg_C | seg_D | seg_F),
-    (0)
+// Lookup table for PORTC segments (Digits 0-9 and blank state)
+uint8_t number_PORTC[] = {
+    (seg_A | seg_B | seg_C | seg_D | seg_E | seg_F), // 0
+    (seg_B | seg_C),                                 // 1
+    (seg_A | seg_B | seg_E | seg_D),                 // 2
+    (seg_A | seg_B | seg_C | seg_D),                 // 3
+    (seg_B | seg_C | seg_F),                         // 4
+    (seg_A | seg_F | seg_C | seg_D),                 // 5
+    (seg_A | seg_F | seg_C | seg_D | seg_E),         // 6
+    (seg_A | seg_B | seg_C),                         // 7
+    (seg_A | seg_B | seg_C | seg_D | seg_E | seg_F), // 8
+    (seg_A | seg_B | seg_C | seg_D | seg_F),         // 9
+    (0)                                              // Cleared segments
 };
 
-// Array containing segment configurations for PORTA (Segment G and DP controls)
-unsigned char number_PORTA[] = {
-    (0),
-    (0),
-    (seg_G),
-    (seg_G),
-    (seg_G),
-    (seg_G),
-    (seg_G),
-    (0),
-    (seg_G),
-    (seg_G | seg_P),
-    (seg_P)
+// Lookup table for PORTA segments (Segment G and Decimal Point for digits 0-9)
+uint8_t number_PORTA[] = {
+    (0), (0), (seg_G), (seg_G), (seg_G), (seg_G), (seg_G), (0), (seg_G), (seg_G | seg_P), (seg_P)
 };
 
-unsigned char number = 0;
+// Global variables
+uint8_t number = 0;                 // Holds the current active sequential digit counter (0-9)
+volatile uint8_t tick_counter = 0;  // Software accumulator increments inside the ISR
+volatile uint8_t tick_counter_on = 0; // Control flag: Activates debounce accumulation in ISR
 
-// Shared variable between ISR and main loop must be declared volatile
-volatile unsigned char tick_counter = 0;
-
-void __interrupt() isr(void)
-{
-    // Check if Timer1 Overflow Interrupt Flag (TMR1IF) is set
-    if(PIR1 & 0x01)
-    {
-        TMR1 = 40536;           // Preload Timer1 to maintain the precise 100 ms interval
-        tick_counter++;
-        PIR1 &= ~0x01;          // Clear the TMR1IF flag safely
+// Interrupt Service Routine (ISR)
+void __interrupt() isr(void){
+    // Check if the interrupt was triggered by a Timer1 overflow
+    if(PIR1 & 0x01){
+        TMR1 = 65286; // Reload for a ~1 ms base tick (65536 - 250 steps @ 4.0 us per step)
+        
+        // Track elapsed time only if the state machine flags debounce tracking active
+        if (tick_counter_on == 1)
+            tick_counter++;
+            
+        PIR1 &= ~0x01; // Clear the Timer1 Interrupt Flag before exiting
     }    
-}
+}  
 
-void main(void) 
-{
-    OSCCON = 0x70;      // Set internal oscillator to 8 MHz
+void main(void) {
+    OSCCON = 0x70;    // Set internal clock to 8 MHz (Instruction cycle Fosc/4 = 2 MHz -> 0.5 us)
 
-    ANSEL = 0;          // Configure analog select registers as digital I/O
-    ANSELH = 0;
+    ANSEL = 0;        // Disable analog functions on PORTA
+    ANSELH = 0;       // Disable analog functions on PORTB (ANSEL High register)
 
-    // Configure display pins on PORTC and PORTA as outputs
-    TRISC &= ~(seg_A | seg_B | seg_C | seg_D | seg_E | seg_F); 
-    PORTC = 0x00;       // Clear PORTC outputs initially
+    // Configure I/O Directions (0 = Output, 1 = Input)
+    TRISC &= ~(seg_A | seg_B | seg_C | seg_D | seg_E | seg_F); // Set PORTC segment pins as outputs
+    PORTC = 0x00;     // Clear PORTC outputs
     
-    TRISA &= ~(seg_G | seg_P); 
-    PORTA &= ~(seg_G | seg_P);  // Clear PORTA outputs initially
+    TRISA &= ~(seg_G | seg_P);  // Set PORTA segment G and P pins as outputs
+    PORTA &= ~(seg_G | seg_P);  // Clear these outputs
     
-    // Timer1 setup: 1:8 Prescaler, peripheral interrupt enabled, Timer1 ON
-    T1CON = 0x31;
-    TMR1 = 40536;       // Initial preload for the first 100 ms tick
+    // Configure Timer1
+    T1CON = 0x31;     // Bits 4-5: T1CKPS = 11 (Prescaler 1:8 -> 4 us steps), Bit 0: TMR1ON = 1 (ON)
+    TMR1 = 65286;     // Seed initial preload
     
-    INTCON = 0xC0;      // Enable Global Interrupts (GIE) and Peripheral Interrupts (PEIE)
-    PIE1 = 0x01;        // Enable Timer1 Overflow Interrupt (TMR1IE)
+    // Enable Core Interrupts
+    INTCON = 0xC0;    // Enable Global Interrupts (GIE) and Peripheral Interrupts (PEIE)
+    PIE1 = 0x01;      // Enable Timer1 Overflow Interrupt (TMR1IE)
+ 
+    TRISA |= btn;     // Set RA3 (button pin) as an input
     
-    // Load initial digit (0) onto the display
+    // Render the initial configuration (digit 0) onto the hardware ports
     PORTA |= number_PORTA[number];
     PORTC = number_PORTC[number];
-    
+
+    // Finite State Machine (FSM) state declaration
+    typedef enum {
+        STATE_IDLE,         // Waiting for a button press transition
+        STATE_DEBOUNCE,     // Filtering mechanical contact noise
+        STATE_WAIT_RELEASE  // Preventing autorepeat until button is released
+    } button_state_t;
+
+    button_state_t state = STATE_IDLE; // Initialize FSM in IDLE state
+
     while(1)
-    {
-        // 1000 ms interval reached (10 ticks * 100 ms)
-        if(tick_counter >= 10)
+    {   
+        // Poll button status: Active-Low configuration (external or internal pull-up).
+        // 'pressed' evaluates to 1 if the switch pulls RA3 down to GND.
+        uint8_t pressed = !(PORTA & (1 << 3)); 
+        
+        switch(state)
         {
-            tick_counter = 0;   // Reset software tick buffer
-            
-            // Cycle digit tracker (0 to 10)
-            if (number >= 10) {
-                number = 0;
-            } else {
-                number++;
-            }
-            
-            // Clear current segment bits and load new values
-            PORTA &= ~(seg_G | seg_P);
-            PORTA |= number_PORTA[number];
-            PORTC = number_PORTC[number];           
+            case STATE_IDLE:
+                // Look for an initial button down transition
+                if(pressed) {
+                    tick_counter = 0;
+                    tick_counter_on = 1;  // Arm debounce accumulation inside the ISR
+                    TMR1 = 64535;
+                    state = STATE_DEBOUNCE;
+                }
+                break;
+                
+            case STATE_DEBOUNCE:
+                // Wait for the counter to track 250 ticks (~250 ms debounce confirmation gate)
+                if(tick_counter >= 250) {
+                    tick_counter_on = 0;  // Turn off debounce interval tracking in the ISR
+                    
+                    // Validate if the button signal remains low after the noise window
+                    if(pressed) {
+                        // Increment and cycle the value index bounds
+                        if (number >= 10) number = 0;
+                        else number++;
+                        
+                        // Output parallel segment states onto PORTA and PORTC
+                        PORTA &= ~(seg_G | seg_P);
+                        PORTA |= number_PORTA[number];
+                        PORTC = number_PORTC[number];
+                        
+                        state = STATE_WAIT_RELEASE; // Advance to hold execution until switch open
+                    } else {
+                        state = STATE_IDLE; // Spurious transient noise detected, return to IDLE
+                    }
+                }
+                break;
+                
+            case STATE_WAIT_RELEASE:
+                // Trap execution here while the user physically holds down the switch
+                if(!pressed) {
+                    state = STATE_IDLE; // Transition back to IDLE once physical link breaks
+                }
+                break;
         }
     }
+    return;
 }
